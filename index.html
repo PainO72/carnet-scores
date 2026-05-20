@@ -464,6 +464,16 @@ body.light #win-screen{background:#f4f3ef}
 }
 .results-table td:last-child{text-align:right;font-weight:500}
 .results-table .winner-row td{color:var(--accent);font-weight:600}
+.results-table .tie-mark{
+  display:inline-block;
+  font-size:8px;font-weight:700;letter-spacing:.8px;
+  color:var(--muted);background:var(--surface2);
+  padding:2px 6px;border-radius:3px;margin-left:6px;
+  vertical-align:middle;border:1px solid var(--border2);
+}
+.results-table .winner-row .tie-mark{
+  color:var(--accent);border-color:rgba(240,201,58,.4);background:rgba(240,201,58,.08);
+}
 .win-btns{display:flex;gap:8px;width:100%;max-width:400px}
 .replay-btn{
   flex:1;padding:14px;
@@ -594,6 +604,7 @@ body.light #win-screen{background:#f4f3ef}
 
 /* Header top buttons */
 .top-actions{display:flex;justify-content:space-between;align-items:center;padding:12px 18px 0;gap:8px}
+.ta-left{display:flex;gap:6px;align-items:center}
 .icon-btn{
   background:var(--surface);border:1px solid var(--border);
   border-radius:20px;padding:5px 12px;
@@ -752,7 +763,10 @@ body.light #win-screen{background:#f4f3ef}
 <!-- ══════════════ SETUP PAGE ══════════════ -->
 <div class="page active" id="setup-page">
   <div class="top-actions">
-    <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="Thème">☀️</button>
+    <div class="ta-left">
+      <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="Thème">☀️</button>
+      <button class="icon-btn" id="fullscreenBtn" onclick="toggleFullscreen()" title="Plein écran">⛶</button>
+    </div>
     <div class="sync-badge" id="syncBadge" onclick="openSyncScreen()">
       <span class="sb-dot"></span><span id="syncBadgeLabel">Non synchronisé</span>
     </div>
@@ -840,7 +854,10 @@ body.light #win-screen{background:#f4f3ef}
 <!-- ══════════════ HISTORY PAGE ══════════════ -->
 <div class="page" id="history-page">
   <div class="top-actions">
-    <button class="icon-btn" onclick="toggleTheme()">☀️</button>
+    <div class="ta-left">
+      <button class="icon-btn" onclick="toggleTheme()">☀️</button>
+      <button class="icon-btn" onclick="toggleFullscreen()" title="Plein écran">⛶</button>
+    </div>
     <div class="sync-badge" id="syncBadge2" onclick="openSyncScreen()">
       <span class="sb-dot"></span><span id="syncBadgeLabel2">Non synchronisé</span>
     </div>
@@ -1173,6 +1190,48 @@ function loadTheme(){
     });
   }
 }
+
+// ────── PLEIN ÉCRAN ──────
+function toggleFullscreen(){
+  const doc = document;
+  const el = doc.documentElement;
+  const isFs = doc.fullscreenElement || doc.webkitFullscreenElement || doc.msFullscreenElement;
+
+  if(!isFs){
+    // Entrer en plein écran
+    const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+    if(req){
+      req.call(el).catch(err => {
+        // iOS Safari ne supporte pas Fullscreen API → on signale gentiment
+        toast("Plein écran non disponible sur ce navigateur", "err");
+      });
+    } else {
+      toast("Plein écran non disponible sur ce navigateur", "err");
+    }
+  } else {
+    // Sortir du plein écran
+    const exit = doc.exitFullscreen || doc.webkitExitFullscreen || doc.msExitFullscreen;
+    if(exit) exit.call(doc);
+  }
+}
+
+function updateFullscreenButtons(){
+  const isFs = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
+  document.querySelectorAll("#fullscreenBtn, .top-actions .icon-btn[title='Plein écran']").forEach(b => {
+    b.textContent = isFs ? "⛶" : "⛶";
+    b.title = isFs ? "Quitter le plein écran" : "Plein écran";
+  });
+  // Bonus visuel : on change la couleur du bouton quand actif
+  document.querySelectorAll(".top-actions .icon-btn").forEach(b => {
+    if(b.title && b.title.includes("écran")){
+      b.style.color = isFs ? "var(--accent)" : "";
+      b.style.borderColor = isFs ? "var(--accent)" : "";
+    }
+  });
+}
+
+document.addEventListener("fullscreenchange", updateFullscreenButtons);
+document.addEventListener("webkitfullscreenchange", updateFullscreenButtons);
 
 // ────── NAV ──────
 function showPage(id){
@@ -1607,25 +1666,64 @@ function endGame(){
 
 // ────── WIN SCREEN ──────
 function showWinScreen(g){
-  const winner = computeWinner(g);
-  document.getElementById("winnerName").textContent = winner.name;
-  document.getElementById("winnerSub").textContent = `${winner.score} POINTS · ${g.rounds.length} MANCHES`;
+  // Calcul du classement avec gestion des ex-aequo
+  const ranking = computeRanking(g);
+  const winners = ranking.filter(p => p.rank === 1);
 
-  // Ranking
-  const totals = computeTotals(g);
-  const ranked = g.players.map((p, i) => ({...p, score: totals[i], idx: i}))
-    .sort((a, b) => g.winCondition === "low" ? a.score - b.score : b.score - a.score);
+  // Titre principal
+  if(winners.length === 1){
+    document.getElementById("winnerName").textContent = winners[0].name;
+    document.getElementById("winnerSub").textContent =
+      `${winners[0].score} POINTS · ${g.rounds.length} MANCHES`;
+  } else {
+    // Plusieurs gagnants ex-aequo
+    const names = winners.map(w => w.name).join(" & ");
+    document.getElementById("winnerName").textContent = names;
+    document.getElementById("winnerSub").textContent =
+      `EX-ÆQUO · ${winners[0].score} POINTS · ${g.rounds.length} MANCHES`;
+  }
 
-  document.getElementById("resultsTable").innerHTML = ranked.map((p, rank) => `
-    <tr class="${rank === 0 ? "winner-row" : ""}">
-      <td>${rank === 0 ? "🏆" : "#" + (rank+1)}</td>
-      <td>${escapeHtml(p.name)}</td>
-      <td>${p.score}</td>
-    </tr>
-  `).join("");
+  // Table de classement
+  document.getElementById("resultsTable").innerHTML = ranking.map(p => {
+    const rankLabel = p.rank === 1 ? "🏆" : "#" + p.rank;
+    const tie = p.tied ? '<span class="tie-mark">EX-ÆQUO</span>' : "";
+    return `
+      <tr class="${p.rank === 1 ? "winner-row" : ""}">
+        <td>${rankLabel}</td>
+        <td>${escapeHtml(p.name)} ${tie}</td>
+        <td>${p.score}</td>
+      </tr>
+    `;
+  }).join("");
 
   document.getElementById("win-screen").style.display = "flex";
   launchConfetti();
+}
+
+// Calcule le classement avec gestion des ex-aequo
+// Retourne un tableau trié de {name, score, rank, tied}
+// rank: les ex-aequo ont le même rang (1, 1, 3, 4, ...)
+// tied: true si au moins un autre joueur a le même score
+function computeRanking(g){
+  const totals = computeTotals(g);
+  const arr = g.players.map((p, i) => ({...p, score: totals[i], idx: i}));
+  const sorted = arr.sort((a, b) => g.winCondition === "low" ? a.score - b.score : b.score - a.score);
+
+  // Attribution des rangs (méthode "standard" : 1, 1, 3, 4, 4, 6...)
+  let currentRank = 1;
+  sorted.forEach((p, i) => {
+    if(i > 0 && p.score !== sorted[i-1].score){
+      currentRank = i + 1;
+    }
+    p.rank = currentRank;
+  });
+
+  // Marquage des ex-aequo
+  sorted.forEach((p, i) => {
+    p.tied = sorted.some((other, j) => j !== i && other.score === p.score);
+  });
+
+  return sorted;
 }
 
 function closeWin(){
@@ -1697,7 +1795,11 @@ function renderHistory(){
 
   const sorted = [...state.history].sort((a, b) => b.endedAt - a.endedAt);
   list.innerHTML = `<div class="history-list">${sorted.map(g => {
-    const w = computeWinner(g);
+    const ranking = computeRanking(g);
+    const winners = ranking.filter(p => p.rank === 1);
+    const winnerDisplay = winners.length === 1
+      ? `${escapeHtml(winners[0].name)} ${winners[0].score}`
+      : `${winners.map(w => escapeHtml(w.name)).join(" & ")} ${winners[0].score}`;
     const date = new Date(g.endedAt);
     const dateStr = date.toLocaleDateString("fr-FR", {day:"numeric", month:"short"}).toUpperCase();
     const playersList = g.players.map(p => escapeHtml(p.name)).join(", ");
@@ -1710,7 +1812,7 @@ function renderHistory(){
         <div class="hist-players">${playersList}</div>
         <div class="hist-bottom">
           <div class="hist-meta">${g.rounds.length} manche${g.rounds.length > 1 ? "s" : ""}</div>
-          <div class="hist-winner">${escapeHtml(w.name)} ${w.score}</div>
+          <div class="hist-winner">${winnerDisplay}</div>
         </div>
       </div>
     `;
@@ -1731,18 +1833,26 @@ function openDetail(id){
 
   document.getElementById("detailBadge").textContent = g.name || "PARTIE";
 
-  const winner = computeWinner(g);
   const totals = computeTotals(g);
-  const winnerIdx = winner.index;
+  const ranking = computeRanking(g);
+  const winners = ranking.filter(p => p.rank === 1);
+  const winnerIdxSet = new Set(winners.map(w => w.idx));
   const date = new Date(g.endedAt);
+
+  // Affichage du vainqueur (ou des co-vainqueurs)
+  const isTie = winners.length > 1;
+  const winnersHtml = isTie
+    ? `<div class="ds-winner">${winners.map(w => escapeHtml(w.name)).join(" & ")}</div>
+       <div class="ds-score">EX-ÆQUO · ${winners[0].score} POINTS</div>`
+    : `<div class="ds-winner">${escapeHtml(winners[0].name)}</div>
+       <div class="ds-score">${winners[0].score} POINTS</div>`;
 
   const html = `
     <div class="detail-summary">
       <div class="ds-glow"></div>
-      <div class="ds-label">VAINQUEUR</div>
+      <div class="ds-label">${isTie ? "VAINQUEURS" : "VAINQUEUR"}</div>
       <span class="ds-trophy">🏆</span>
-      <div class="ds-winner">${escapeHtml(winner.name)}</div>
-      <div class="ds-score">${winner.score} POINTS</div>
+      ${winnersHtml}
       <div class="ds-meta">${date.toLocaleDateString("fr-FR", {day:"numeric", month:"long", year:"numeric"}).toUpperCase()} · ${g.rounds.length} MANCHES${g.scoreLimit ? ` · LIMITE ${g.scoreLimit}` : ""}</div>
     </div>
 
@@ -1765,7 +1875,7 @@ function openDetail(id){
             `).join("")}
             <tr class="total-row">
               <td>TOTAL</td>
-              ${totals.map((t, i) => `<td class="${i === winnerIdx ? "winner-cell" : ""}">${t}</td>`).join("")}
+              ${totals.map((t, i) => `<td class="${winnerIdxSet.has(i) ? "winner-cell" : ""}">${t}</td>`).join("")}
             </tr>
           </tbody>
         </table>
