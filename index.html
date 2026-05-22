@@ -685,12 +685,6 @@ body.light #win-screen{background:#f4f3ef}
   font-size:12px;color:var(--muted);cursor:pointer;
   text-decoration:underline;padding:8px;
 }
-.sync-disconnect{
-  margin-top:14px;background:transparent;border:1px solid var(--border2);
-  color:var(--red);font-family:var(--mono);font-size:12px;
-  border-radius:var(--r);padding:10px 18px;cursor:pointer;
-}
-.sync-disconnect:active{background:rgba(232,84,71,.08)}
 .sync-status{
   font-family:var(--mono);font-size:12px;
   margin-top:14px;min-height:18px;
@@ -921,8 +915,7 @@ body.light #win-screen{background:#f4f3ef}
     <input class="sync-input" id="syncCodeInput" type="number" inputmode="numeric" placeholder="ex: 1234">
   </div>
   <button class="sync-btn" onclick="connectSync()">Connecter</button>
-  <span class="sync-skip" onclick="skipSync()">Continuer sans synchronisation</span>
-  <button class="sync-disconnect" id="syncDisconnect" onclick="disconnectSync()" style="display:none">Se déconnecter</button>
+  <span class="sync-skip" onclick="skipSync()">Se déconnecter / Sans synchronisation</span>
   <div class="sync-status" id="syncStatus"></div>
 </div>
 
@@ -987,18 +980,53 @@ function save(){
 
 // ────── SYNC CLOUD (Firebase Firestore) ──────
 const FIREBASE_CFG = {
-  apiKey: "AIzaSyDemo-RemplacezParVotreCle",
-  authDomain: "scores-demo.firebaseapp.com",
-  projectId: "scores-demo"
+  apiKey: "AIzaSyDiqHNp8WSTX8GiUpbbp9fIeeIfve_NdIM",
+  authDomain: "carnet-scores.firebaseapp.com",
+  projectId: "carnet-scores"
 };
 // ⚠️ Ces valeurs DOIVENT être remplacées par les vôtres (voir INSTALLATION.md)
 // Tant qu'elles ne sont pas configurées, l'app fonctionne en local uniquement.
 
 const SYNC_CODE_KEY = "scorekeeper.syncCode";
+const TOMBSTONES_GAMES_KEY = "scorekeeper.tombstones.games";
+const TOMBSTONES_PLAYERS_KEY = "scorekeeper.tombstones.players";
+const TOMBSTONES_GAMENAMES_KEY = "scorekeeper.tombstones.gamenames";
+const TOMBSTONE_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 jours
 let db = null;
 let syncGroupId = null;
 let syncEnabled = false;
 let pushTimer = null;
+let suppressNextPush = false; // évite de pousser pendant qu'on applique un pull
+
+function loadTombstones(key){
+  try{
+    const raw = localStorage.getItem(key);
+    if(!raw) return {};
+    const data = JSON.parse(raw);
+    // Purger les tombstones trop vieux
+    const now = Date.now();
+    let cleaned = false;
+    for(const k in data){
+      if(now - data[k] > TOMBSTONE_TTL_MS){ delete data[k]; cleaned = true; }
+    }
+    if(cleaned) localStorage.setItem(key, JSON.stringify(data));
+    return data;
+  }catch(e){ return {}; }
+}
+function addTombstone(key, id){
+  const t = loadTombstones(key);
+  t[id] = Date.now();
+  try{ localStorage.setItem(key, JSON.stringify(t)); }catch(e){}
+}
+function mergeTombstones(local, cloud){
+  const merged = {...local};
+  if(cloud && typeof cloud === "object"){
+    for(const id in cloud){
+      if(!(id in merged) || cloud[id] > merged[id]) merged[id] = cloud[id];
+    }
+  }
+  return merged;
+}
 
 function initFirebase(){
   try{
@@ -1017,18 +1045,21 @@ function openSyncScreen(){
   document.getElementById("syncStatus").textContent = "";
   document.getElementById("syncStatus").className = "sync-status";
   const sub = document.getElementById("syncSubText");
-  const disconnectBtn = document.getElementById("syncDisconnect");
   if(saved && syncEnabled){
     sub.innerHTML = `Connecté à la session <strong style="color:var(--accent)">${saved}</strong>.<br>Modifiez le code pour changer de session.`;
-    disconnectBtn.style.display = "";
   } else {
     sub.innerHTML = `Choisissez un code unique pour votre session.<br>Entrez le même code sur chaque appareil<br>pour partager vos parties.`;
-    disconnectBtn.style.display = "none";
   }
 }
 
 function skipSync(){
+  // Effacer le code et déconnecter (comme l'app fléchettes)
+  localStorage.removeItem(SYNC_CODE_KEY);
+  syncEnabled = false;
+  syncGroupId = null;
   document.getElementById("sync-screen").classList.remove("show");
+  updateSyncBadge();
+  toast("Déconnecté de la synchronisation");
 }
 
 async function connectSync(){
@@ -1067,15 +1098,6 @@ async function connectSync(){
   }
 }
 
-function disconnectSync(){
-  syncEnabled = false;
-  syncGroupId = null;
-  localStorage.removeItem(SYNC_CODE_KEY);
-  updateSyncBadge();
-  document.getElementById("sync-screen").classList.remove("show");
-  toast("Déconnecté de la synchronisation");
-}
-
 async function pullCloud(){
   if(!syncEnabled || !db) return;
   try{
@@ -1083,37 +1105,58 @@ async function pullCloud(){
     if(!snap.exists) return;
     const cloud = snap.data() || {};
 
-    // Fusion historique : par id de partie, le plus récent gagne
+    // ── Fusion des tombstones (suppressions) ──
+    const localTombGames = loadTombstones(TOMBSTONES_GAMES_KEY);
+    const localTombPlayers = loadTombstones(TOMBSTONES_PLAYERS_KEY);
+    const localTombGameNames = loadTombstones(TOMBSTONES_GAMENAMES_KEY);
+    const mergedTombGames = mergeTombstones(localTombGames, cloud.tombstoneGames);
+    const mergedTombPlayers = mergeTombstones(localTombPlayers, cloud.tombstonePlayers);
+    const mergedTombGameNames = mergeTombstones(localTombGameNames, cloud.tombstoneGameNames);
+    localStorage.setItem(TOMBSTONES_GAMES_KEY, JSON.stringify(mergedTombGames));
+    localStorage.setItem(TOMBSTONES_PLAYERS_KEY, JSON.stringify(mergedTombPlayers));
+    localStorage.setItem(TOMBSTONES_GAMENAMES_KEY, JSON.stringify(mergedTombGameNames));
+
+    // ── Fusion historique : par id de partie, le plus récent gagne, en excluant les tombstones ──
     const cloudHist = Array.isArray(cloud.history) ? cloud.history : [];
     const byId = new Map();
     [...state.history, ...cloudHist].forEach(g => {
       if(!g || !g.id) return;
+      // Si la partie est dans les tombstones et plus vieille que la suppression : on ignore
+      if(mergedTombGames[g.id] && (g.endedAt || 0) <= mergedTombGames[g.id]) return;
       const existing = byId.get(g.id);
-      if(!existing || (g.endedAt || 0) > (existing.endedAt || 0)){
+      // Le plus récemment modifié gagne. updatedAt prioritaire, sinon endedAt
+      const gTs = g.updatedAt || g.endedAt || 0;
+      const eTs = existing ? (existing.updatedAt || existing.endedAt || 0) : 0;
+      if(!existing || gTs > eTs){
         byId.set(g.id, g);
       }
     });
     state.history = Array.from(byId.values());
 
-    // Fusion noms connus (ordre conservé du plus récent au plus ancien)
-    const mergeKnown = (key, cloudArr) => {
-      if(!Array.isArray(cloudArr) || !cloudArr.length) return;
+    // ── Fusion noms connus (avec tombstones) ──
+    const mergeKnown = (key, cloudArr, tombMap) => {
+      if(!Array.isArray(cloudArr)) cloudArr = [];
       const local = loadKnown(key);
       const seen = new Set();
       const merged = [];
       [...local, ...cloudArr].forEach(n => {
         const k = String(n).toLowerCase();
-        if(!seen.has(k)){ seen.add(k); merged.push(n); }
+        if(seen.has(k)) return;
+        // Si ce nom est dans les tombstones, on ne le ressuscite pas
+        if(tombMap[k]) return;
+        seen.add(k); merged.push(n);
       });
       saveKnown(key, merged);
     };
-    mergeKnown(KNOWN_PLAYERS_KEY, cloud.knownPlayers);
-    mergeKnown(KNOWN_GAMES_KEY, cloud.knownGames);
+    mergeKnown(KNOWN_PLAYERS_KEY, cloud.knownPlayers, mergedTombPlayers);
+    mergeKnown(KNOWN_GAMES_KEY, cloud.knownGames, mergedTombGameNames);
 
-    // Persister localement (en évitant de redéclencher un push immédiat)
+    // Persister localement (sans déclencher un push immédiat)
+    suppressNextPush = true;
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       history: state.history, current: state.current
     }));
+    suppressNextPush = false;
   }catch(e){ console.warn("pullCloud:", e); }
 }
 
@@ -1124,19 +1167,55 @@ async function pushCloud(){
       history: state.history,
       knownPlayers: loadKnown(KNOWN_PLAYERS_KEY),
       knownGames: loadKnown(KNOWN_GAMES_KEY),
+      tombstoneGames: loadTombstones(TOMBSTONES_GAMES_KEY),
+      tombstonePlayers: loadTombstones(TOMBSTONES_PLAYERS_KEY),
+      tombstoneGameNames: loadTombstones(TOMBSTONES_GAMENAMES_KEY),
       updatedAt: Date.now()
     });
   }catch(e){ console.warn("pushCloud:", e); }
 }
 
 // Débounce des push : 800ms après le dernier save()
+// IMPORTANT : on fait pull → merge → push pour ne pas écraser
+// les modifications faites en parallèle sur d'autres appareils.
+let pushInFlight = false;
+let pushQueued = false;
+
+async function safePushCloud(){
+  if(!syncEnabled || !db) return;
+  // Si un push est déjà en cours, on en programme un autre après
+  if(pushInFlight){ pushQueued = true; return; }
+  pushInFlight = true;
+  try{
+    // 1) Pull pour récupérer ce que d'autres appareils ont pu pousser entre temps
+    await pullCloud();
+    // 2) Re-render pour montrer immédiatement les nouveautés à l'utilisateur
+    if(document.getElementById("history-page").classList.contains("active")){
+      renderHistory();
+    }
+    // 3) Push de l'état fusionné (local + cloud)
+    await pushCloud();
+  }catch(e){ console.warn("safePushCloud:", e); }
+  finally{
+    pushInFlight = false;
+    if(pushQueued){
+      pushQueued = false;
+      // Réenchainer un push si une modification est survenue pendant celui-ci
+      setTimeout(safePushCloud, 200);
+    }
+  }
+}
+
 function schedulePushCloud(){
   if(!syncEnabled || !db) return;
+  if(suppressNextPush) return;
   clearTimeout(pushTimer);
-  pushTimer = setTimeout(pushCloud, 800);
+  pushTimer = setTimeout(safePushCloud, 800);
 }
 
 function updateSyncBadge(){
+  // On se base sur localStorage (immédiat) plutôt que sur syncEnabled (async)
+  // pour que le badge reflète l'état dès le démarrage
   const code = localStorage.getItem(SYNC_CODE_KEY);
   const badges = [
     {b: "syncBadge", l: "syncBadgeLabel"},
@@ -1146,7 +1225,7 @@ function updateSyncBadge(){
     const badge = document.getElementById(b);
     const label = document.getElementById(l);
     if(!badge || !label) return;
-    if(syncEnabled && code){
+    if(code){
       badge.classList.add("connected");
       label.textContent = "Session " + code;
     } else {
@@ -1264,10 +1343,20 @@ function rememberName(key, name){
   let a = loadKnown(key).filter(n => n.toLowerCase() !== name.toLowerCase());
   a.unshift(name);
   saveKnown(key, a);
+  // Si ce nom était dans les tombstones, on le retire (l'utilisateur veut le ressusciter)
+  const tombKey = (key === KNOWN_GAMES_KEY) ? TOMBSTONES_GAMENAMES_KEY : TOMBSTONES_PLAYERS_KEY;
+  const tomb = loadTombstones(tombKey);
+  if(tomb[name.toLowerCase()]){
+    delete tomb[name.toLowerCase()];
+    try{ localStorage.setItem(tombKey, JSON.stringify(tomb)); }catch(e){}
+  }
   schedulePushCloud();
 }
 function forgetName(key, name){
   saveKnown(key, loadKnown(key).filter(n => n !== name));
+  // Enregistrer le tombstone pour éviter la résurrection lors de la prochaine sync
+  const tombKey = (key === KNOWN_GAMES_KEY) ? TOMBSTONES_GAMENAMES_KEY : TOMBSTONES_PLAYERS_KEY;
+  addTombstone(tombKey, name.toLowerCase());
   schedulePushCloud();
 }
 
@@ -1591,6 +1680,7 @@ function validateRound(){
     return v === "" ? 0 : parseInt(v, 10) || 0;
   });
   state.current.rounds.push(scores);
+  state.current.updatedAt = Date.now();
   save();
   renderGame();
 
@@ -1637,6 +1727,7 @@ function limitModalContinue(){
 function undoRound(){
   if(state.current.rounds.length === 0) return;
   state.current.rounds.pop();
+  state.current.updatedAt = Date.now();
   save();
   renderGame();
 }
@@ -1657,7 +1748,7 @@ function endGame(){
     toast("Ajoutez au moins une manche", "err");
     return;
   }
-  const finished = {...state.current, endedAt: Date.now()};
+  const finished = {...state.current, endedAt: Date.now(), updatedAt: Date.now()};
   state.history.push(finished);
   state.current = null;
   save();
@@ -1887,6 +1978,7 @@ function openDetail(id){
   document.getElementById("detailDelete").onclick = () => {
     if(confirm("Supprimer définitivement cette partie ?")){
       state.history = state.history.filter(x => x.id !== id);
+      addTombstone(TOMBSTONES_GAMES_KEY, id);
       save();
       navTo("history-page");
     }
